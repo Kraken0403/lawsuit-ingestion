@@ -1,0 +1,28 @@
+{
+    "name": "ingestion",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+      "preview": "tsx src/scripts/previewCase.ts",
+      "create-collection": "tsx src/scripts/createCollection.ts",
+      "ingest": "tsx src/scripts/ingestCases.ts",
+      "search": "tsx src/scripts/searchPreview.ts",
+      "create-hybrid-collection": "tsx src/scripts/createHybridCollection.ts",
+      "ingest-hybrid": "tsx src/scripts/ingestHybridCases.ts",
+      "hybrid-search": "tsx src/scripts/hybridSearch.ts"
+    },
+    "dependencies": {
+        "@qdrant/js-client-rest": "^1.17.0",
+        "cheerio": "^1.2.0",
+        "dotenv": "^16.4.5",
+        "he": "^1.2.0",
+        "html-entities": "^2.6.0",
+        "mssql": "^11.0.1"
+    },
+    "devDependencies": {
+        "@types/node": "^22.19.15",
+        "tsx": "^4.21.0",
+        "typescript": "^5.9.3"
+    }
+}
