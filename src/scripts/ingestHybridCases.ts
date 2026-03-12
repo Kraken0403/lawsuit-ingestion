@@ -1,4 +1,4 @@
-import { fetchCasesBatch } from "../db/sql.js";
+import { fetchCasesBatchInRange } from "../db/sql.js";
 import { parseCase } from "../parser/parseCase.js";
 import { chunkParagraphs } from "../parser/chunker.js";
 import type { RawCaseRow } from "../parser/types.js";
@@ -9,12 +9,19 @@ import { env } from "../config/env.js";
 
 async function main() {
   const startAfterId = Number(process.argv[2] || 100000);
-  const totalCaseTarget = Number(process.argv[3] || 1000);
+  const endId = Number(process.argv[3] || 120000);
   const chunkWordTarget = Number(process.argv[4] || 600);
   const dbBatchSize = Number(process.argv[5] || 100);
 
-  console.log(`Starting hybrid ingestion after file_name=${startAfterId}`);
-  console.log(`Total case target=${totalCaseTarget}`);
+  if (!Number.isFinite(startAfterId) || !Number.isFinite(endId)) {
+    throw new Error("startAfterId and endId must be numbers");
+  }
+
+  if (endId <= startAfterId) {
+    throw new Error("endId must be greater than startAfterId");
+  }
+
+  console.log(`Starting hybrid ingestion in range (${startAfterId}, ${endId}]`);
   console.log(`Chunk target words=${chunkWordTarget}`);
   console.log(`DB batch size=${dbBatchSize}`);
 
@@ -28,25 +35,20 @@ async function main() {
   let totalChunks = 0;
   const startedAt = Date.now();
 
-  while (totalCases < totalCaseTarget) {
-    const remaining = totalCaseTarget - totalCases;
-    const batchLimit = Math.min(dbBatchSize, remaining);
-
+  while (true) {
     console.log(
-      `\nFetching next DB batch after file_name=${cursor}, limit=${batchLimit}...`
+      `\nFetching next DB batch in range after file_name=${cursor}, endId=${endId}, limit=${dbBatchSize}...`
     );
 
-    const rows = await fetchCasesBatch(cursor, batchLimit);
+    const rows = await fetchCasesBatchInRange(cursor, endId, dbBatchSize);
 
     if (!rows.length) {
-      console.log("No more rows returned from DB. Stopping.");
+      console.log("No more rows returned in this range. Stopping.");
       break;
     }
 
     console.log(
-      `Fetched ${rows.length} rows: ${rows[0].file_name} -> ${
-        rows[rows.length - 1].file_name
-      }`
+      `Fetched ${rows.length} rows: ${rows[0].file_name} -> ${rows[rows.length - 1].file_name}`
     );
 
     for (const row of rows) {
@@ -93,18 +95,22 @@ async function main() {
       const chunksPerMin = totalChunks / Math.max(elapsedMinutes, 0.001);
 
       console.log(
-        `Ingested case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length} | totalCases=${totalCases}/${totalCaseTarget} totalChunks=${totalChunks} cases/min=${casesPerMin.toFixed(
+        `Ingested case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length} | totalCases=${totalCases} totalChunks=${totalChunks} cases/min=${casesPerMin.toFixed(
           2
         )} chunks/min=${chunksPerMin.toFixed(2)}`
       );
+    }
 
-      if (totalCases >= totalCaseTarget) break;
+    if (cursor >= endId) {
+      console.log(`Cursor reached endId (${endId}). Stopping.`);
+      break;
     }
   }
 
   const totalMinutes = (Date.now() - startedAt) / 1000 / 60;
 
   console.log("\nDone.");
+  console.log(`Range=(${startAfterId}, ${endId}]`);
   console.log(`Final cursor=${cursor}`);
   console.log(`cases=${totalCases}`);
   console.log(`chunks=${totalChunks}`);
