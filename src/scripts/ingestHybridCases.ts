@@ -13,9 +13,20 @@ function saveProgress(filePath: string, data: Record<string, unknown>) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
+function loadProgress(filePath: string): Record<string, any> | null {
+  if (!fs.existsSync(filePath)) return null;
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (err) {
+    console.warn(`Could not read progress file ${filePath}:`, err);
+    return null;
+  }
+}
+
 async function embedChunksSafely(
   chunks: Chunk[],
-  batchSize = 16
+  batchSize = 24
 ): Promise<{
   keptChunks: Chunk[];
   denseVectors: number[][];
@@ -114,9 +125,32 @@ async function main() {
     env.embedding.dimensions
   );
 
+  const savedProgress = loadProgress(progressFile);
+
   let cursor = startAfterId;
-  let totalCases = 0;
-  let totalChunks = 0;
+
+  if (
+    savedProgress &&
+    Number.isFinite(savedProgress.currentCursor) &&
+    savedProgress.currentCursor >= startAfterId &&
+    savedProgress.currentCursor < endId
+  ) {
+    cursor = savedProgress.currentCursor;
+    console.log(
+      `Resuming from saved cursor=${cursor} using progress file ${progressFile}`
+    );
+  }
+
+  let totalCases =
+    savedProgress && Number.isFinite(savedProgress.totalCases)
+      ? savedProgress.totalCases
+      : 0;
+
+  let totalChunks =
+    savedProgress && Number.isFinite(savedProgress.totalChunks)
+      ? savedProgress.totalChunks
+      : 0;
+
   const startedAt = Date.now();
 
   while (true) {
