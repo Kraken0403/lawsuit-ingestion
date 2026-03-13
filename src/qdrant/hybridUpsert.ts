@@ -26,11 +26,17 @@ function buildSparseText(parsedCase: ParsedCase, chunk: Chunk): string {
     parsedCase.caseNo ? `case no: ${parsedCase.caseNo}` : "",
     parsedCase.caseType ? `case type: ${parsedCase.caseType}` : "",
     parsedCase.court ? `court: ${parsedCase.court}` : "",
-    parsedCase.dateOfDecision ? `date of decision: ${parsedCase.dateOfDecision}` : "",
+    parsedCase.dateOfDecision
+      ? `date of decision: ${parsedCase.dateOfDecision}`
+      : "",
     parsedCase.subject ? `subject: ${parsedCase.subject}` : "",
-    parsedCase.finalDecision ? `final decision: ${parsedCase.finalDecision}` : "",
+    parsedCase.finalDecision
+      ? `final decision: ${parsedCase.finalDecision}`
+      : "",
     parsedCase.judges?.length ? `judges: ${compact(parsedCase.judges)}` : "",
-    parsedCase.actsReferred?.length ? `acts referred: ${compact(parsedCase.actsReferred)}` : "",
+    parsedCase.actsReferred?.length
+      ? `acts referred: ${compact(parsedCase.actsReferred)}`
+      : "",
     parsedCase.equivalentCitations?.length
       ? `equivalent citations: ${compact(parsedCase.equivalentCitations)}`
       : "",
@@ -47,7 +53,7 @@ export function buildHybridPoints(
 ): HybridPoint[] {
   if (chunks.length !== denseVectors.length) {
     throw new Error(
-      `Chunks/vectors mismatch: chunks=${chunks.length} vectors=${vectors.length}`
+      `Chunks/vectors mismatch: chunks=${chunks.length} vectors=${denseVectors.length}`
     );
   }
 
@@ -97,14 +103,73 @@ export function buildHybridPoints(
   });
 }
 
+function estimatePointBytes(point: HybridPoint): number {
+  return Buffer.byteLength(JSON.stringify(point), "utf8");
+}
+
+function splitPointsForQdrant(
+  points: HybridPoint[],
+  maxBatchBytes = 8 * 1024 * 1024, // 8 MB safety target
+  maxPointsPerBatch = 25
+): HybridPoint[][] {
+  const batches: HybridPoint[][] = [];
+  let currentBatch: HybridPoint[] = [];
+  let currentBytes = 0;
+
+  for (const point of points) {
+    const pointBytes = estimatePointBytes(point);
+
+    // If a single point is huge, still send it alone.
+    if (pointBytes > maxBatchBytes) {
+      if (currentBatch.length) {
+        batches.push(currentBatch);
+        currentBatch = [];
+        currentBytes = 0;
+      }
+
+      batches.push([point]);
+      continue;
+    }
+
+    const exceedsByteLimit = currentBytes + pointBytes > maxBatchBytes;
+    const exceedsPointLimit = currentBatch.length >= maxPointsPerBatch;
+
+    if ((exceedsByteLimit || exceedsPointLimit) && currentBatch.length) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBytes = 0;
+    }
+
+    currentBatch.push(point);
+    currentBytes += pointBytes;
+  }
+
+  if (currentBatch.length) {
+    batches.push(currentBatch);
+  }
+
+  return batches;
+}
+
 export async function upsertHybridPoints(
   collectionName: string,
   points: HybridPoint[]
 ): Promise<void> {
   if (!points.length) return;
 
-  await qdrant.upsert(collectionName, {
-    wait: true,
-    points,
-  });
+  const batches = splitPointsForQdrant(points, 8 * 1024 * 1024, 25);
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const approxBytes = batch.reduce((sum, p) => sum + estimatePointBytes(p), 0);
+
+    console.log(
+      `Qdrant upsert batch ${i + 1}/${batches.length} with ${batch.length} points (~${(approxBytes / 1024 / 1024).toFixed(2)} MB)`
+    );
+
+    await qdrant.upsert(collectionName, {
+      wait: true,
+      points: batch,
+    });
+  }
 }

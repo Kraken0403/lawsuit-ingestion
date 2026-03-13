@@ -9,6 +9,10 @@ import { ensureHybridCollection } from "../qdrant/hybridCollections.js";
 import { buildHybridPoints, upsertHybridPoints } from "../qdrant/hybridUpsert.js";
 import { env } from "../config/env.js";
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function saveProgress(filePath: string, data: Record<string, unknown>) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
@@ -21,6 +25,50 @@ function loadProgress(filePath: string): Record<string, any> | null {
   } catch (err) {
     console.warn(`Could not read progress file ${filePath}:`, err);
     return null;
+  }
+}
+
+async function fetchCasesBatchWithRetry(
+  cursor: number,
+  endId: number,
+  dbBatchSize: number,
+  maxRetries = 8
+) {
+  let attempt = 0;
+
+  while (true) {
+    try {
+      return await fetchCasesBatchInRange(cursor, endId, dbBatchSize);
+    } catch (err: any) {
+      attempt += 1;
+      const message = err?.message || "Unknown DB error";
+      const code = err?.code || "UNKNOWN";
+
+      if (attempt > maxRetries) {
+        console.error(
+          `DB fetch permanently failed after ${maxRetries} retries. code=${code} message=${message}`
+        );
+        throw err;
+      }
+
+      const retryable =
+        code === "ETIMEOUT" ||
+        message.includes("TimeoutError") ||
+        message.includes("Failed to connect") ||
+        message.includes("timed out");
+
+      if (!retryable) {
+        throw err;
+      }
+
+      const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000);
+
+      console.warn(
+        `DB fetch failed (attempt ${attempt}/${maxRetries}, code=${code}). Retrying in ${delay}ms... message=${message}`
+      );
+
+      await sleep(delay);
+    }
   }
 }
 
@@ -49,6 +97,9 @@ async function embedChunksSafely(
 
       keptChunks.push(...batchChunks);
       denseVectors.push(...batchVectors);
+
+      // Smooth TPM spikes a bit
+      await sleep(300);
     } catch (err: any) {
       const message = err?.message || "Unknown embedding error";
 
@@ -71,8 +122,11 @@ async function embedChunksSafely(
           const vectors = await embedTextsInBatches([chunk.text], 1);
           keptChunks.push(chunk);
           denseVectors.push(vectors[0]);
+
+          await sleep(150);
         } catch (innerErr: any) {
-          const innerMessage = innerErr?.message || "Unknown embedding error";
+          const innerMessage =
+            innerErr?.message || "Unknown embedding error";
 
           if (
             innerErr?.status === 400 &&
@@ -158,7 +212,7 @@ async function main() {
       `\nFetching next DB batch in range after file_name=${cursor}, endId=${endId}, limit=${dbBatchSize}...`
     );
 
-    const rows = await fetchCasesBatchInRange(cursor, endId, dbBatchSize);
+    const rows = await fetchCasesBatchWithRetry(cursor, endId, dbBatchSize);
 
     if (!rows.length) {
       console.log("No more rows returned in this range. Stopping.");
@@ -197,13 +251,28 @@ async function main() {
         continue;
       }
 
+      if (chunks.length > 300) {
+        console.warn(
+          `Large case detected: case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length}`
+        );
+      }
+
       console.log(
         `Preparing embeddings for case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length}`
       );
 
+      const adaptiveBatchSize =
+        chunks.length > 500 ? 8 :
+        chunks.length > 200 ? 12 :
+        24;
+
+      console.log(
+        `Using adaptive embedding batch size=${adaptiveBatchSize} for case=${parsed.caseId}`
+      );
+
       const { keptChunks, denseVectors, skipped } = await embedChunksSafely(
         chunks,
-        24
+        adaptiveBatchSize
       );
 
       if (!keptChunks.length) {
