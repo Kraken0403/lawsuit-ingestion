@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { fetchCasesBatchInRange } from "../db/sql.js";
 import { parseCase } from "../parser/parseCase.js";
 import { chunkParagraphs } from "../parser/chunker.js";
@@ -7,11 +9,17 @@ import { ensureHybridCollection } from "../qdrant/hybridCollections.js";
 import { buildHybridPoints, upsertHybridPoints } from "../qdrant/hybridUpsert.js";
 import { env } from "../config/env.js";
 
+function saveProgress(filePath: string, data: Record<string, unknown>) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
 async function main() {
   const startAfterId = Number(process.argv[2] || 100000);
   const endId = Number(process.argv[3] || 120000);
   const chunkWordTarget = Number(process.argv[4] || 600);
   const dbBatchSize = Number(process.argv[5] || 100);
+  const workerName = process.argv[6] || "worker";
+  const progressFile = path.resolve(`./progress-${workerName}.json`);
 
   if (!Number.isFinite(startAfterId) || !Number.isFinite(endId)) {
     throw new Error("startAfterId and endId must be numbers");
@@ -24,6 +32,8 @@ async function main() {
   console.log(`Starting hybrid ingestion in range (${startAfterId}, ${endId}]`);
   console.log(`Chunk target words=${chunkWordTarget}`);
   console.log(`DB batch size=${dbBatchSize}`);
+  console.log(`Worker name=${workerName}`);
+  console.log(`Progress file=${progressFile}`);
 
   await ensureHybridCollection(
     env.qdrant.hybridCollection,
@@ -79,13 +89,31 @@ async function main() {
         continue;
       }
 
+      console.log(
+        `Preparing embeddings for case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length}`
+      );
+
       const denseVectors = await embedTextsInBatches(
         chunks.map((c) => c.text),
-        32
+        16
+      );
+
+      console.log(
+        `Finished embeddings for case=${parsed.caseId}, building Qdrant points...`
       );
 
       const points = buildHybridPoints(parsed, chunks, denseVectors);
+
+      const upsertStartedAt = Date.now();
+      console.log(
+        `Upserting ${points.length} points to Qdrant for case=${parsed.caseId}...`
+      );
+
       await upsertHybridPoints(env.qdrant.hybridCollection, points);
+
+      console.log(
+        `Finished Qdrant upsert for case=${parsed.caseId} in ${Date.now() - upsertStartedAt}ms`
+      );
 
       totalCases += 1;
       totalChunks += chunks.length;
@@ -93,6 +121,17 @@ async function main() {
       const elapsedMinutes = (Date.now() - startedAt) / 1000 / 60;
       const casesPerMin = totalCases / Math.max(elapsedMinutes, 0.001);
       const chunksPerMin = totalChunks / Math.max(elapsedMinutes, 0.001);
+
+      saveProgress(progressFile, {
+        workerName,
+        startAfterId,
+        endId,
+        currentCursor: cursor,
+        lastCompletedCaseId: parsed.caseId,
+        totalCases,
+        totalChunks,
+        updatedAt: new Date().toISOString(),
+      });
 
       console.log(
         `Ingested case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length} | totalCases=${totalCases} totalChunks=${totalChunks} cases/min=${casesPerMin.toFixed(
