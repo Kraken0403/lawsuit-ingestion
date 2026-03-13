@@ -203,7 +203,7 @@ async function main() {
 
       const { keptChunks, denseVectors, skipped } = await embedChunksSafely(
         chunks,
-        16
+        24
       );
 
       if (!keptChunks.length) {
