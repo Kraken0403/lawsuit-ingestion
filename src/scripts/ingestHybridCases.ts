@@ -14,7 +14,8 @@ function saveProgress(filePath: string, data: Record<string, unknown>) {
 }
 
 async function embedChunksSafely(
-  chunks: Chunk[]
+  chunks: Chunk[],
+  batchSize = 16
 ): Promise<{
   keptChunks: Chunk[];
   denseVectors: number[][];
@@ -24,28 +25,62 @@ async function embedChunksSafely(
   const denseVectors: number[][] = [];
   const skipped: Array<{ index: number; reason: string }> = [];
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
+  for (let i = 0; i < chunks.length; i += batchSize) {
+    const batchChunks = chunks.slice(i, i + batchSize);
+    const batchTexts = batchChunks.map((c) => c.text);
 
     try {
-      const vectors = await embedTextsInBatches([chunk.text], 1);
-      keptChunks.push(chunk);
-      denseVectors.push(vectors[0]);
+      console.log(
+        `Embedding safe batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(chunks.length / batchSize)} with ${batchChunks.length} chunks`
+      );
+
+      const batchVectors = await embedTextsInBatches(batchTexts, batchSize);
+
+      keptChunks.push(...batchChunks);
+      denseVectors.push(...batchVectors);
     } catch (err: any) {
       const message = err?.message || "Unknown embedding error";
 
-      if (
+      const isContextLengthError =
         err?.status === 400 &&
-        message.includes("maximum context length")
-      ) {
-        console.warn(
-          `Skipping oversized chunk at index=${i} for case=${chunk.caseId}: ${message}`
-        );
-        skipped.push({ index: i, reason: "maximum context length" });
-        continue;
+        message.includes("maximum context length");
+
+      if (!isContextLengthError) {
+        throw err;
       }
 
-      throw err;
+      console.warn(
+        `Batch embedding failed due to oversized chunk(s). Falling back to per-chunk embedding for this batch...`
+      );
+
+      for (let j = 0; j < batchChunks.length; j++) {
+        const chunk = batchChunks[j];
+
+        try {
+          const vectors = await embedTextsInBatches([chunk.text], 1);
+          keptChunks.push(chunk);
+          denseVectors.push(vectors[0]);
+        } catch (innerErr: any) {
+          const innerMessage = innerErr?.message || "Unknown embedding error";
+
+          if (
+            innerErr?.status === 400 &&
+            innerMessage.includes("maximum context length")
+          ) {
+            const originalIndex = i + j;
+            console.warn(
+              `Skipping oversized chunk at index=${originalIndex} for case=${chunk.caseId}: ${innerMessage}`
+            );
+            skipped.push({
+              index: originalIndex,
+              reason: "maximum context length",
+            });
+            continue;
+          }
+
+          throw innerErr;
+        }
+      }
     }
   }
 
@@ -132,7 +167,10 @@ async function main() {
         `Preparing embeddings for case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length}`
       );
 
-      const { keptChunks, denseVectors, skipped } = await embedChunksSafely(chunks);
+      const { keptChunks, denseVectors, skipped } = await embedChunksSafely(
+        chunks,
+        16
+      );
 
       if (!keptChunks.length) {
         console.warn(
