@@ -3,7 +3,7 @@ import path from "node:path";
 import { fetchCasesBatchInRange } from "../db/sql.js";
 import { parseCase } from "../parser/parseCase.js";
 import { chunkParagraphs } from "../parser/chunker.js";
-import type { RawCaseRow } from "../parser/types.js";
+import type { RawCaseRow, Chunk } from "../parser/types.js";
 import { embedTextsInBatches } from "../embeddings/embed.js";
 import { ensureHybridCollection } from "../qdrant/hybridCollections.js";
 import { buildHybridPoints, upsertHybridPoints } from "../qdrant/hybridUpsert.js";
@@ -11,6 +11,45 @@ import { env } from "../config/env.js";
 
 function saveProgress(filePath: string, data: Record<string, unknown>) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+async function embedChunksSafely(
+  chunks: Chunk[]
+): Promise<{
+  keptChunks: Chunk[];
+  denseVectors: number[][];
+  skipped: Array<{ index: number; reason: string }>;
+}> {
+  const keptChunks: Chunk[] = [];
+  const denseVectors: number[][] = [];
+  const skipped: Array<{ index: number; reason: string }> = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+
+    try {
+      const vectors = await embedTextsInBatches([chunk.text], 1);
+      keptChunks.push(chunk);
+      denseVectors.push(vectors[0]);
+    } catch (err: any) {
+      const message = err?.message || "Unknown embedding error";
+
+      if (
+        err?.status === 400 &&
+        message.includes("maximum context length")
+      ) {
+        console.warn(
+          `Skipping oversized chunk at index=${i} for case=${chunk.caseId}: ${message}`
+        );
+        skipped.push({ index: i, reason: "maximum context length" });
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  return { keptChunks, denseVectors, skipped };
 }
 
 async function main() {
@@ -93,16 +132,26 @@ async function main() {
         `Preparing embeddings for case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length}`
       );
 
-      const denseVectors = await embedTextsInBatches(
-        chunks.map((c) => c.text),
-        16
-      );
+      const { keptChunks, denseVectors, skipped } = await embedChunksSafely(chunks);
+
+      if (!keptChunks.length) {
+        console.warn(
+          `Skipped case=${parsed.caseId} because all chunks failed embedding`
+        );
+        continue;
+      }
+
+      if (skipped.length) {
+        console.warn(
+          `Case=${parsed.caseId} skipped ${skipped.length} oversized chunks`
+        );
+      }
 
       console.log(
         `Finished embeddings for case=${parsed.caseId}, building Qdrant points...`
       );
 
-      const points = buildHybridPoints(parsed, chunks, denseVectors);
+      const points = buildHybridPoints(parsed, keptChunks, denseVectors);
 
       const upsertStartedAt = Date.now();
       console.log(
@@ -116,7 +165,7 @@ async function main() {
       );
 
       totalCases += 1;
-      totalChunks += chunks.length;
+      totalChunks += keptChunks.length;
 
       const elapsedMinutes = (Date.now() - startedAt) / 1000 / 60;
       const casesPerMin = totalCases / Math.max(elapsedMinutes, 0.001);
@@ -130,11 +179,12 @@ async function main() {
         lastCompletedCaseId: parsed.caseId,
         totalCases,
         totalChunks,
+        skippedChunksInLastCase: skipped.length,
         updatedAt: new Date().toISOString(),
       });
 
       console.log(
-        `Ingested case=${parsed.caseId} title="${parsed.title}" chunks=${chunks.length} | totalCases=${totalCases} totalChunks=${totalChunks} cases/min=${casesPerMin.toFixed(
+        `Ingested case=${parsed.caseId} title="${parsed.title}" keptChunks=${keptChunks.length} skippedChunks=${skipped.length} | totalCases=${totalCases} totalChunks=${totalChunks} cases/min=${casesPerMin.toFixed(
           2
         )} chunks/min=${chunksPerMin.toFixed(2)}`
       );

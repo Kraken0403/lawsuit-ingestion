@@ -1,5 +1,16 @@
 import type { Chunk, JudgmentParagraph } from "./types.js";
 
+function splitTextByWordLimit(text: string, maxWords: number): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return [text.trim()];
+
+  const parts: string[] = [];
+  for (let i = 0; i < words.length; i += maxWords) {
+    parts.push(words.slice(i, i + maxWords).join(" ").trim());
+  }
+  return parts;
+}
+
 export function chunkParagraphs(
   caseId: number,
   paragraphs: JudgmentParagraph[],
@@ -9,16 +20,36 @@ export function chunkParagraphs(
   const chunks: Chunk[] = [];
   if (!paragraphs.length) return chunks;
 
+  const normalizedParagraphs: JudgmentParagraph[] = [];
+
+  for (const para of paragraphs) {
+    const paraWords = para.text.split(/\s+/).filter(Boolean).length;
+
+    if (paraWords <= targetWords) {
+      normalizedParagraphs.push(para);
+      continue;
+    }
+
+    const splitParts = splitTextByWordLimit(para.text, targetWords);
+
+    for (const part of splitParts) {
+      normalizedParagraphs.push({
+        ...para,
+        text: part,
+      });
+    }
+  }
+
   let start = 0;
   let chunkIndex = 0;
 
-  while (start < paragraphs.length) {
+  while (start < normalizedParagraphs.length) {
     let words = 0;
     let end = start;
     const selected: JudgmentParagraph[] = [];
 
-    while (end < paragraphs.length) {
-      const para = paragraphs[end];
+    while (end < normalizedParagraphs.length) {
+      const para = normalizedParagraphs[end];
       const paraWords = para.text.split(/\s+/).filter(Boolean).length;
 
       if (selected.length > 0 && words + paraWords > targetWords) {
@@ -51,7 +82,7 @@ export function chunkParagraphs(
 
     chunkIndex++;
 
-    if (end >= paragraphs.length) break;
+    if (end >= normalizedParagraphs.length) break;
     start = Math.max(end - overlapParagraphs, start + 1);
   }
 
