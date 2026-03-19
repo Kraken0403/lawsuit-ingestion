@@ -9,23 +9,70 @@ import { ensureHybridCollection } from "../qdrant/hybridCollections.js";
 import { buildHybridPoints, upsertHybridPoints } from "../qdrant/hybridUpsert.js";
 import { env } from "../config/env.js";
 
+type ProgressState = {
+  workerName: string;
+  startAfterId: number;
+  endId: number;
+  currentCursor: number;
+  lastCompletedCaseId: number | null;
+  totalCases: number;
+  totalChunks: number;
+  skippedChunksInLastCase: number;
+  updatedAt: string;
+};
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function saveProgress(filePath: string, data: Record<string, unknown>) {
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
-function loadProgress(filePath: string): Record<string, any> | null {
+function saveProgressAtomic(filePath: string, data: ProgressState) {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tempPath, filePath);
+}
+
+function loadProgress(filePath: string): ProgressState | null {
   if (!fs.existsSync(filePath)) return null;
 
   try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    return parsed as ProgressState;
   } catch (err) {
     console.warn(`Could not read progress file ${filePath}:`, err);
     return null;
   }
+}
+
+function isValidProgressForRun(
+  progress: ProgressState | null,
+  workerName: string,
+  startAfterId: number,
+  endId: number
+): progress is ProgressState {
+  return Boolean(
+    progress &&
+      progress.workerName === workerName &&
+      isFiniteNumber(progress.startAfterId) &&
+      progress.startAfterId === startAfterId &&
+      isFiniteNumber(progress.endId) &&
+      progress.endId === endId &&
+      isFiniteNumber(progress.currentCursor) &&
+      progress.currentCursor >= startAfterId &&
+      progress.currentCursor < endId &&
+      isFiniteNumber(progress.totalCases) &&
+      progress.totalCases >= 0 &&
+      isFiniteNumber(progress.totalChunks) &&
+      progress.totalChunks >= 0
+  );
 }
 
 async function fetchCasesBatchWithRetry(
@@ -98,7 +145,6 @@ async function embedChunksSafely(
       keptChunks.push(...batchChunks);
       denseVectors.push(...batchVectors);
 
-      // Smooth TPM spikes a bit
       await sleep(300);
     } catch (err: any) {
       const message = err?.message || "Unknown embedding error";
@@ -164,6 +210,14 @@ async function main() {
     throw new Error("startAfterId and endId must be numbers");
   }
 
+  if (!Number.isFinite(chunkWordTarget) || chunkWordTarget <= 0) {
+    throw new Error("chunkWordTarget must be a positive number");
+  }
+
+  if (!Number.isFinite(dbBatchSize) || dbBatchSize <= 0) {
+    throw new Error("dbBatchSize must be a positive number");
+  }
+
   if (endId <= startAfterId) {
     throw new Error("endId must be greater than startAfterId");
   }
@@ -182,63 +236,140 @@ async function main() {
   const savedProgress = loadProgress(progressFile);
 
   let cursor = startAfterId;
+  let totalCases = 0;
+  let totalChunks = 0;
 
-  if (
-    savedProgress &&
-    Number.isFinite(savedProgress.currentCursor) &&
-    savedProgress.currentCursor >= startAfterId &&
-    savedProgress.currentCursor < endId
-  ) {
+  if (isValidProgressForRun(savedProgress, workerName, startAfterId, endId)) {
     cursor = savedProgress.currentCursor;
+    totalCases = savedProgress.totalCases;
+    totalChunks = savedProgress.totalChunks;
+
     console.log(
       `Resuming from saved cursor=${cursor} using progress file ${progressFile}`
     );
+  } else if (savedProgress) {
+    console.warn(
+      `Ignoring stale or mismatched progress file ${progressFile}. Starting fresh for this exact worker/range.`
+    );
   }
 
-  let totalCases =
-    savedProgress && Number.isFinite(savedProgress.totalCases)
-      ? savedProgress.totalCases
-      : 0;
+  let shouldStop = false;
 
-  let totalChunks =
-    savedProgress && Number.isFinite(savedProgress.totalChunks)
-      ? savedProgress.totalChunks
-      : 0;
+  const requestStop = (signal: string) => {
+    if (!shouldStop) {
+      shouldStop = true;
+      console.warn(`Received ${signal}. Will stop after the current case finishes.`);
+    }
+  };
+
+  process.on("SIGINT", () => requestStop("SIGINT"));
+  process.on("SIGTERM", () => requestStop("SIGTERM"));
 
   const startedAt = Date.now();
+  let sessionCases = 0;
+  let sessionChunks = 0;
 
-  while (true) {
+  let lastBatchSignature: string | null = null;
+  let repeatedBatchCount = 0;
+
+  while (cursor < endId && !shouldStop) {
+    const fetchCursor = cursor;
+
     console.log(
-      `\nFetching next DB batch in range after file_name=${cursor}, endId=${endId}, limit=${dbBatchSize}...`
+      `\nFetching next DB batch in range after file_name=${fetchCursor}, endId=${endId}, limit=${dbBatchSize}...`
     );
 
-    const rows = await fetchCasesBatchWithRetry(cursor, endId, dbBatchSize);
+    const rows = await fetchCasesBatchWithRetry(fetchCursor, endId, dbBatchSize);
 
     if (!rows.length) {
       console.log("No more rows returned in this range. Stopping.");
       break;
     }
 
+    const firstFileName = Number(rows[0].file_name);
+    const lastFileName = Number(rows[rows.length - 1].file_name);
+
+    if (!Number.isFinite(firstFileName) || !Number.isFinite(lastFileName)) {
+      throw new Error("DB returned non-numeric file_name values");
+    }
+
+    if (firstFileName <= fetchCursor) {
+      throw new Error(
+        `Non-forward batch detected: first row ${firstFileName} <= cursor ${fetchCursor}. Refusing to loop.`
+      );
+    }
+
+    const batchSignature = `${firstFileName}:${lastFileName}:${rows.length}`;
+    if (batchSignature === lastBatchSignature) {
+      repeatedBatchCount += 1;
+
+      if (repeatedBatchCount >= 2) {
+        throw new Error(
+          `Same DB batch repeated multiple times (${batchSignature}). Refusing to continue.`
+        );
+      }
+    } else {
+      lastBatchSignature = batchSignature;
+      repeatedBatchCount = 0;
+    }
+
     console.log(
-      `Fetched ${rows.length} rows: ${rows[0].file_name} -> ${rows[rows.length - 1].file_name}`
+      `Fetched ${rows.length} rows: ${firstFileName} -> ${lastFileName}`
     );
 
+    let progressedThisBatch = false;
+
     for (const row of rows) {
-      cursor = row.file_name;
+      if (shouldStop) break;
+
+      const rowFileName = Number(row.file_name);
+
+      if (!Number.isFinite(rowFileName)) {
+        console.warn(`Skipping row with invalid file_name: ${row.file_name}`);
+        continue;
+      }
+
+      if (rowFileName <= cursor) {
+        console.warn(
+          `Skipping non-forward row file_name=${rowFileName} at cursor=${cursor}`
+        );
+        continue;
+      }
+
+      progressedThisBatch = true;
+
+      let skippedChunksInLastCase = 0;
+      let parsedCaseIdForProgress: number | null = rowFileName;
 
       if (!row.jtext) {
-        console.log(`Skipped case ${row.file_name}: empty jtext`);
+        cursor = rowFileName;
+
+        saveProgressAtomic(progressFile, {
+          workerName,
+          startAfterId,
+          endId,
+          currentCursor: cursor,
+          lastCompletedCaseId: parsedCaseIdForProgress,
+          totalCases,
+          totalChunks,
+          skippedChunksInLastCase,
+          updatedAt: new Date().toISOString(),
+        });
+
+        console.log(`Skipped case ${rowFileName}: empty jtext`);
         continue;
       }
 
       const raw: RawCaseRow = {
-        fileName: row.file_name,
+        fileName: rowFileName,
         ftype: row.ftype,
         flag: row.flag,
         html: row.jtext,
       };
 
       const parsed = parseCase(raw);
+      parsedCaseIdForProgress = parsed.caseId;
+
       const chunks = chunkParagraphs(
         parsed.caseId,
         parsed.paragraphs,
@@ -247,6 +378,20 @@ async function main() {
       );
 
       if (!chunks.length) {
+        cursor = rowFileName;
+
+        saveProgressAtomic(progressFile, {
+          workerName,
+          startAfterId,
+          endId,
+          currentCursor: cursor,
+          lastCompletedCaseId: parsedCaseIdForProgress,
+          totalCases,
+          totalChunks,
+          skippedChunksInLastCase,
+          updatedAt: new Date().toISOString(),
+        });
+
         console.log(`Skipped case ${parsed.caseId}: no chunks`);
         continue;
       }
@@ -275,7 +420,23 @@ async function main() {
         adaptiveBatchSize
       );
 
+      skippedChunksInLastCase = skipped.length;
+
       if (!keptChunks.length) {
+        cursor = rowFileName;
+
+        saveProgressAtomic(progressFile, {
+          workerName,
+          startAfterId,
+          endId,
+          currentCursor: cursor,
+          lastCompletedCaseId: parsedCaseIdForProgress,
+          totalCases,
+          totalChunks,
+          skippedChunksInLastCase,
+          updatedAt: new Date().toISOString(),
+        });
+
         console.warn(
           `Skipped case=${parsed.caseId} because all chunks failed embedding`
         );
@@ -305,14 +466,13 @@ async function main() {
         `Finished Qdrant upsert for case=${parsed.caseId} in ${Date.now() - upsertStartedAt}ms`
       );
 
+      cursor = rowFileName;
       totalCases += 1;
       totalChunks += keptChunks.length;
+      sessionCases += 1;
+      sessionChunks += keptChunks.length;
 
-      const elapsedMinutes = (Date.now() - startedAt) / 1000 / 60;
-      const casesPerMin = totalCases / Math.max(elapsedMinutes, 0.001);
-      const chunksPerMin = totalChunks / Math.max(elapsedMinutes, 0.001);
-
-      saveProgress(progressFile, {
+      saveProgressAtomic(progressFile, {
         workerName,
         startAfterId,
         endId,
@@ -320,14 +480,24 @@ async function main() {
         lastCompletedCaseId: parsed.caseId,
         totalCases,
         totalChunks,
-        skippedChunksInLastCase: skipped.length,
+        skippedChunksInLastCase,
         updatedAt: new Date().toISOString(),
       });
 
+      const elapsedMinutes = (Date.now() - startedAt) / 1000 / 60;
+      const sessionCasesPerMin = sessionCases / Math.max(elapsedMinutes, 0.001);
+      const sessionChunksPerMin = sessionChunks / Math.max(elapsedMinutes, 0.001);
+
       console.log(
-        `Ingested case=${parsed.caseId} title="${parsed.title}" keptChunks=${keptChunks.length} skippedChunks=${skipped.length} | totalCases=${totalCases} totalChunks=${totalChunks} cases/min=${casesPerMin.toFixed(
+        `Ingested case=${parsed.caseId} title="${parsed.title}" keptChunks=${keptChunks.length} skippedChunks=${skipped.length} | totalCases=${totalCases} totalChunks=${totalChunks} sessionCases/min=${sessionCasesPerMin.toFixed(
           2
-        )} chunks/min=${chunksPerMin.toFixed(2)}`
+        )} sessionChunks/min=${sessionChunksPerMin.toFixed(2)}`
+      );
+    }
+
+    if (!progressedThisBatch) {
+      throw new Error(
+        `Fetched ${rows.length} rows but made no forward progress from cursor=${fetchCursor}. Refusing to continue.`
       );
     }
 
@@ -339,7 +509,12 @@ async function main() {
 
   const totalMinutes = (Date.now() - startedAt) / 1000 / 60;
 
-  console.log("\nDone.");
+  if (shouldStop) {
+    console.log("\nStopped cleanly after signal.");
+  } else {
+    console.log("\nDone.");
+  }
+
   console.log(`Range=(${startAfterId}, ${endId}]`);
   console.log(`Final cursor=${cursor}`);
   console.log(`cases=${totalCases}`);
